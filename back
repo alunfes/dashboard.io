@@ -1,0 +1,453 @@
+"""
+Cross‑sectional crypto strategies: (A) correlation‑decoupling mean‑reversion and (B) flow‑persistence momentum.
+
+What this script does
+---------------------
+1) Loads OHLCV CSVs for multiple symbols (same timeframe) or generates toy data.
+2) Builds a simple market index (equal‑weighted) and estimates rolling EWMA beta & correlation to the index.
+3) Constructs two market‑neutral portfolios:
+   A) Decoupling‑Reversion: short coins that rally while de‑correlating from the market and long the rest; and vice‑versa.
+   B) Flow‑Persistence: long strong coins (price+volume strength) and short weak ones.
+4) Projects raw weights to be dollar and beta neutral. Applies turnover costs (bps) and optional funding.
+5) Backtests both side‑by‑side and prints a compact tearsheet; saves results under ./out/
+
+How to run
+----------
+$ pip install pandas numpy matplotlib
+$ python crypto_dispersion_momentum_backtest.py --data_dir ./data --symbols BTC,ETH,SOL,BNB,XRP --timeframe 1h
+
+Data format
+-----------
+Each symbol CSV in --data_dir should be named {SYMBOL}.csv with at least columns:
+  timestamp, open, high, low, close, volume
+Timestamp must be UTC ISO or epoch milliseconds/seconds. Mixed timezones are OK (we infer/pandas parse then UTC floor).
+
+Notes
+-----
+- Funding rates (perp) are optional. If provided as {SYMBOL}_funding.csv with columns [timestamp, rate] (per period), the backtest adds funding P&L (position * notional * rate). If absent, assumed 0.
+- If you don’t have data at hand, run with --demo to generate a toy universe.
+- Default parameters are conservative; tune spans/thresholds/holding windows to your venue/latency/fees.
+
+MIT‑style: adapt freely.
+"""
+from __future__ import annotations
+import os, argparse, math, json
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -----------------------
+# Utility helpers
+# -----------------------
+
+def _ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def parse_symbols(arg: str) -> List[str]:
+    return [s.strip().upper() for s in arg.split(',') if s.strip()]
+
+
+def to_utc_index(df: pd.DataFrame, ts_col: str = 'timestamp') -> pd.DataFrame:
+    df = df.copy()
+    if np.issubdtype(df[ts_col].dtype, np.number):
+        # epoch seconds or ms
+        # heuristic: ms if values are large
+        ts = pd.to_datetime(df[ts_col], unit='ms') if df[ts_col].astype(np.int64).max() > 10_000_000_000 else pd.to_datetime(df[ts_col], unit='s')
+    else:
+        ts = pd.to_datetime(df[ts_col], utc=True)
+    df.index = ts.tz_convert('UTC') if ts.dt.tz is not None else ts.tz_localize('UTC')
+    df = df.sort_index()
+    return df.drop(columns=[ts_col]) if ts_col in df.columns else df
+
+
+def resample_ohlcv(df: pd.DataFrame, tf: str) -> pd.DataFrame:
+    o = df['open'].resample(tf).first()
+    h = df['high'].resample(tf).max()
+    l = df['low'].resample(tf).min()
+    c = df['close'].resample(tf).last()
+    v = df['volume'].resample(tf).sum()
+    out = pd.concat({'open': o, 'high': h, 'low': l, 'close': c, 'volume': v}, axis=1).dropna()
+    return out
+
+
+def load_one_symbol_csv(path: str, timeframe: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df = to_utc_index(df)
+    cols = {c.lower(): c for c in df.columns}
+    req = ['open','high','low','close','volume']
+    if not all(c in [x.lower() for x in df.columns] for c in req):
+        raise ValueError(f"CSV missing one of required columns {req}: {path}")
+    # Normalize column names
+    df = df.rename(columns={cols.get('open','open'):'open', cols.get('high','high'):'high', cols.get('low','low'):'low', cols.get('close','close'):'close', cols.get('volume','volume'):'volume'})
+    if timeframe:
+        df = resample_ohlcv(df, timeframe)
+    return df
+
+
+def load_prices(data_dir: str, symbols: List[str], timeframe: str) -> Dict[str, pd.DataFrame]:
+    out = {}
+    for s in symbols:
+        fp = os.path.join(data_dir, f"{s}.csv")
+        if not os.path.exists(fp):
+            raise FileNotFoundError(f"{fp} not found. Provide CSVs or use --demo.")
+        out[s] = load_one_symbol_csv(fp, timeframe)
+    return out
+
+
+def align_close(prices: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    # returns a wide df of close prices
+    dfs = []
+    for s, df in prices.items():
+        dfs.append(df[['close']].rename(columns={'close': s}))
+    wide = pd.concat(dfs, axis=1).dropna(how='any')
+    return wide
+
+
+def align_volume(prices: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    dfs = []
+    for s, df in prices.items():
+        dfs.append(df[['volume']].rename(columns={'volume': s}))
+    wide = pd.concat(dfs, axis=1).reindex_like(align_close(prices)).fillna(0.0)
+    return wide
+
+
+def make_index(prices_wide: pd.DataFrame, method: str = 'equal') -> pd.Series:
+    if method == 'equal':
+        return prices_wide.pct_change().mean(axis=1).add(1).cumprod().fillna(method='ffill')
+    else:
+        raise NotImplementedError("Only equal‑weighted index implemented.")
+
+
+def returns_from_prices(prices: pd.DataFrame) -> pd.DataFrame:
+    return prices.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def ewm_cov(x: pd.Series, y: pd.Series, span: int) -> pd.Series:
+    x_c = x - x.ewm(span=span, adjust=False).mean()
+    y_c = y - y.ewm(span=span, adjust=False).mean()
+    cov = (x_c * y_c).ewm(span=span, adjust=False).mean()
+    return cov
+
+
+def ewm_corr(x: pd.Series, y: pd.Series, span: int) -> pd.Series:
+    cov = ewm_cov(x, y, span)
+    varx = (x - x.ewm(span=span, adjust=False).mean())**2
+    vary = (y - y.ewm(span=span, adjust=False).mean())**2
+    sx = varx.ewm(span=span, adjust=False).mean().pow(0.5)
+    sy = vary.ewm(span=span, adjust=False).mean().pow(0.5)
+    return cov / (sx * sy + 1e-12)
+
+
+def rolling_beta(r_i: pd.Series, r_m: pd.Series, span: int) -> Tuple[pd.Series, pd.Series]:
+    cov = ewm_cov(r_i, r_m, span)
+    var_m = ewm_cov(r_m, r_m, span)
+    beta = cov / (var_m + 1e-12)
+    resid = r_i - beta * r_m
+    return beta.fillna(0.0), resid.fillna(0.0)
+
+
+def xsect_zscore(frame: pd.DataFrame) -> pd.DataFrame:
+    mu = frame.mean(axis=1)
+    sd = frame.std(axis=1).replace(0.0, np.nan)
+    z = (frame.sub(mu, axis=0)).div(sd, axis=0)
+    return z.fillna(0.0)
+
+
+# -----------------------
+# Signal A: Decoupling‑Reversion
+# -----------------------
+@dataclass
+class DecoupleConfig:
+    corr_span: int = 96          # EWMA span for corr/beta (e.g., 96 bars ~ 4d on 1h data)
+    delta_lookback: int = 24     # compare correlation change over this many bars
+    resid_span: int = 96         # EWMA for residual z‑score
+    z_resid_entry: float = 1.0   # residual z threshold to trigger
+    d_corr_entry: float = 0.10   # absolute correlation change threshold (e.g., 0.10)
+    strength_pow: float = 1.0    # nonlinearity on signal strength
+
+
+def build_decouple_signal(returns: pd.DataFrame, r_m: pd.Series, cfg: DecoupleConfig) -> pd.DataFrame:
+    betas = pd.DataFrame(index=returns.index, columns=returns.columns)
+    resids = pd.DataFrame(index=returns.index, columns=returns.columns)
+    corrs  = pd.DataFrame(index=returns.index, columns=returns.columns)
+    for s in returns.columns:
+        b, resid = rolling_beta(returns[s], r_m, span=cfg.corr_span)
+        betas[s] = b
+        resids[s] = resid
+        corrs[s] = ewm_corr(returns[s], r_m, span=cfg.corr_span)
+    # residual z‑score over time (per symbol)
+    resid_z = (resids - resids.ewm(span=cfg.resid_span, adjust=False).mean()) / (resids.ewm(span=cfg.resid_span, adjust=False).std() + 1e-12)
+    resid_z = resid_z.clip(-5, 5).fillna(0.0)
+    # correlation change
+    d_corr = corrs - corrs.shift(cfg.delta_lookback)
+    d_corr = d_corr.fillna(0.0)
+    # Entry logic:
+    # If resid_z > z and d_corr < -d  -> asset rallied vs market while correlation dropped: SHORT asset (expect re‑correlation)
+    # If resid_z < -z and d_corr > d  -> asset dumped while correlation jumped: LONG asset
+    short_mask = (resid_z > cfg.z_resid_entry) & (d_corr < -abs(cfg.d_corr_entry))
+    long_mask  = (resid_z < -cfg.z_resid_entry) & (d_corr >  abs(cfg.d_corr_entry))
+    # Strength
+    strength = (resid_z.abs() * d_corr.abs()).pow(cfg.strength_pow)
+    raw = strength.where(long_mask, 0.0) - strength.where(short_mask, 0.0)
+    # Normalize cross‑sectionally each bar to reduce concentration
+    raw = raw.apply(lambda row: row / (row.abs().sum() + 1e-12), axis=1).fillna(0.0)
+    return raw, betas, corrs, resid_z, d_corr
+
+
+# -----------------------
+# Signal B: Flow‑Persistence Momentum (price + volume strength)
+# -----------------------
+@dataclass
+class MomentumConfig:
+    lookbacks: Tuple[int, int, int] = (24, 72, 168)  # bars for 1d/3d/7d on 1h data
+    weights: Tuple[float, float, float] = (0.5, 0.3, 0.2)
+    vol_span: int = 168                              # EWMA span for volume surprise
+    vol_weight: float = 0.4                          # blend weight for volume factor
+
+
+def build_momentum_signal(prices: pd.DataFrame, volumes: pd.DataFrame, cfg: MomentumConfig) -> pd.DataFrame:
+    rets = prices.pct_change().fillna(0.0)
+    # Multi‑horizon relative strength
+    scores = 0
+    for lb, w in zip(cfg.lookbacks, cfg.weights):
+        rs = (prices / prices.shift(lb)) - 1.0
+        scores = scores + w * xsect_zscore(rs)
+    # Volume surprise (current vol vs EWMA)
+    vol_surp = volumes / (volumes.ewm(span=cfg.vol_span, adjust=False).mean() + 1e-12) - 1.0
+    vol_z = xsect_zscore(vol_surp)
+    composite = (1 - cfg.vol_weight) * scores + cfg.vol_weight * vol_z
+    # Raw signal: long high composite, short low composite
+    raw = composite.apply(lambda row: row / (row.abs().sum() + 1e-12), axis=1).fillna(0.0)
+    return raw
+
+
+# -----------------------
+# Portfolio projection: enforce dollar & beta neutrality
+# -----------------------
+
+def project_neutral(raw_w: pd.Series, betas: pd.Series, max_abs_w: float = 0.10) -> pd.Series:
+    w = raw_w.copy().fillna(0.0)
+    # Initial cap
+    w = w.clip(lower=-max_abs_w, upper=max_abs_w)
+    # Solve: min ||w' - w||^2 s.t. 1'w' = 0 and beta'w' = 0
+    A = np.vstack([np.ones(len(w)), betas.values]).astype(float)  # 2 x N
+    b = np.array([0.0, 0.0])
+    # Use projection via Lagrange multipliers
+    W = w.values.reshape(-1, 1)
+    ATA = A @ A.T + 1e-9 * np.eye(2)
+    lam = np.linalg.solve(ATA, A @ W - b.reshape(-1,1))
+    w_prime = W - A.T @ lam
+    w_prime = np.squeeze(w_prime)
+    # Re‑cap
+    w_prime = np.clip(w_prime, -max_abs_w, max_abs_w)
+    # Re‑center to exactly meet constraints (small numerical fix)
+    # Second pass
+    W = w_prime.reshape(-1,1)
+    lam = np.linalg.solve(ATA, A @ W - b.reshape(-1,1))
+    w_prime = np.squeeze(W - A.T @ lam)
+    return pd.Series(w_prime, index=w.index)
+
+
+# -----------------------
+# Backtest engine
+# -----------------------
+@dataclass
+class CostConfig:
+    fee_bps: float = 2.0        # taker fee per side in bps (0.02% default)
+    slippage_bps: float = 1.0   # extra slippage per trade in bps
+    funding: bool = False       # include funding P&L if available
+
+
+def apply_funding(weights: pd.DataFrame, funding: Dict[str, pd.Series]) -> pd.Series:
+    # funding rate per period; P&L = sum_i (w_i * rate_i)
+    # assumes weights are dollar‑neutral; positive w means long notional
+    pnl = pd.Series(0.0, index=weights.index)
+    for s in weights.columns:
+        if s in funding:
+            fr = funding[s].reindex(weights.index).fillna(0.0)
+            pnl = pnl.add(weights[s] * fr, fill_value=0.0)
+    return pnl
+
+
+def backtest(prices: pd.DataFrame,
+             signal: pd.DataFrame,
+             betas: pd.DataFrame,
+             costs: CostConfig,
+             gross_leverage: float = 1.0,
+             max_abs_w: float = 0.10) -> Tuple[pd.Series, pd.DataFrame, pd.DataFrame]:
+    rets = prices.pct_change().fillna(0.0)
+    idx = prices.index
+    cols = prices.columns
+
+    w_raw = signal.copy().fillna(0.0)
+    # Project each bar
+    W = []
+    for t in idx:
+        raw_w_t = w_raw.loc[t]
+        beta_t = betas.loc[t].fillna(0.0)
+        w_t = project_neutral(raw_w_t, beta_t, max_abs_w=max_abs_w)
+        # scale to target gross
+        gross = w_t.abs().sum()
+        if gross > 1e-12:
+            w_t = w_t * (gross_leverage / gross)
+        W.append(w_t)
+    W = pd.DataFrame(W, index=idx, columns=cols)
+
+    # Turnover & trading costs
+    turnover = (W.diff().abs().sum(axis=1)).fillna(0.0)
+    trade_cost = turnover * ((costs.fee_bps + costs.slippage_bps) / 10_000.0)
+
+    # PnL
+    pnl_gross = (W.shift(1) * rets).sum(axis=1).fillna(0.0)
+
+    # Funding P&L (optional) – placeholder: 0 unless provided externally
+    funding_pnl = pd.Series(0.0, index=idx)
+
+    pnl_net = pnl_gross - trade_cost + funding_pnl
+
+    return pnl_net, W, turnover
+
+
+# -----------------------
+# Metrics & plotting
+# -----------------------
+
+def sharpe(pnl: pd.Series, periods_per_year: int) -> float:
+    mu = pnl.mean() * periods_per_year
+    sd = pnl.std(ddof=0) * math.sqrt(periods_per_year)
+    return 0.0 if sd == 0 else mu / sd
+
+
+def max_drawdown(cum: pd.Series) -> float:
+    peak = cum.cummax()
+    dd = (cum - peak) / peak
+    return dd.min()
+
+
+def summarize(pnl: pd.Series, label: str, periods_per_year: int) -> Dict[str, float]:
+    cum = (1 + pnl).cumprod()
+    N = len(pnl)
+    ann = (cum.iloc[-1] ** (periods_per_year / max(N,1))) - 1 if N > 0 else 0.0
+    out = {
+        'label': label,
+        'AnnRet': ann,
+        'Sharpe': sharpe(pnl, periods_per_year),
+        'Vol': pnl.std() * math.sqrt(periods_per_year),
+        'MaxDD': max_drawdown(cum),
+        'Turnover/Day': np.nan,  # filled by caller if available
+    }
+    return out
+
+
+def plot_equity(curves: Dict[str, pd.Series], outdir: str):
+    _ensure_dir(outdir)
+    for label, curve in curves.items():
+        plt.figure()
+        (1 + curve).cumprod().plot()
+        plt.title(f"Equity Curve: {label}")
+        plt.xlabel("Time")
+        plt.ylabel("Equity")
+        fp = os.path.join(outdir, f"equity_{label}.png")
+        plt.tight_layout(); plt.savefig(fp, dpi=150); plt.close()
+
+
+# -----------------------
+# Demo data generator
+# -----------------------
+
+def gen_demo(symbols: List[str], periods: int = 24*180, seed: int = 42) -> Dict[str, pd.DataFrame]:
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range('2024-01-01', periods=periods, freq='H', tz='UTC')
+    market = rng.normal(0, 0.005, size=periods)
+    out = {}
+    for i, s in enumerate(symbols):
+        beta = 0.8 + 0.4 * rng.random()
+        idio = rng.normal(0, 0.008, size=periods)
+        r = beta * market + idio
+        p = 100 * np.cumprod(1 + r)
+        v = rng.lognormal(mean=8, sigma=0.3, size=periods)
+        df = pd.DataFrame({'open': p, 'high': p*(1+0.001), 'low': p*(1-0.001), 'close': p, 'volume': v}, index=idx)
+        out[s] = df
+    return out
+
+
+# -----------------------
+# Main
+# -----------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, default='./data')
+    parser.add_argument('--symbols', type=str, default='BTC,ETH,SOL,BNB,XRP')
+    parser.add_argument('--timeframe', type=str, default='1H', help='Pandas offset alias (e.g., 1T, 5T, 15T, 1H)')
+    parser.add_argument('--demo', action='store_true')
+    parser.add_argument('--out', type=str, default='./out')
+    parser.add_argument('--gross', type=float, default=1.0)
+    parser.add_argument('--max_abs_w', type=float, default=0.10)
+    parser.add_argument('--fee_bps', type=float, default=2.0)
+    parser.add_argument('--slip_bps', type=float, default=1.0)
+    args = parser.parse_args()
+
+    _ensure_dir(args.out)
+
+    symbols = parse_symbols(args.symbols)
+
+    if args.demo:
+        prices_dict = gen_demo(symbols)
+    else:
+        prices_dict = load_prices(args.data_dir, symbols, args.timeframe)
+
+    prices = align_close(prices_dict)
+    volumes = align_volume(prices_dict)
+
+    # Simple equal‑weighted market index; benchmark returns
+    idx_prices = make_index(prices, method='equal')
+    r_m = idx_prices.pct_change().fillna(0.0)
+
+    # ---------- Build signals ----------
+    dec_cfg = DecoupleConfig()
+    dec_signal, betas, corrs, resid_z, d_corr = build_decouple_signal(returns_from_prices(prices), r_m, dec_cfg)
+
+    mom_cfg = MomentumConfig()
+    mom_signal = build_momentum_signal(prices, volumes, mom_cfg)
+
+    # For momentum we still need betas to neutralize each bar (use same betas)
+    costs = CostConfig(fee_bps=args.fee_bps, slippage_bps=args.slip_bps, funding=False)
+
+    pnl_dec, w_dec, t_dec = backtest(prices, dec_signal, betas, costs, gross_leverage=args.gross, max_abs_w=args.max_abs_w)
+    pnl_mom, w_mom, t_mom = backtest(prices, mom_signal, betas, costs, gross_leverage=args.gross, max_abs_w=args.max_abs_w)
+
+    # ---------- Summaries ----------
+    # Infer periods/year from index frequency (approx)
+    if len(prices.index) > 1:
+        freq = (prices.index[1] - prices.index[0]).total_seconds()
+    else:
+        freq = 3600.0
+    periods_per_year = int(round(365*24*3600 / max(freq,1)))
+
+    s_dec = summarize(pnl_dec, 'DecoupleMR', periods_per_year)
+    s_mom = summarize(pnl_mom, 'FlowMomentum', periods_per_year)
+    s_dec['Turnover/Day'] = t_dec.resample('1D').mean().mean()
+    s_mom['Turnover/Day'] = t_mom.resample('1D').mean().mean()
+
+    print("\n=== Strategy Summary ===")
+    for s in [s_dec, s_mom]:
+        print(json.dumps(s, indent=2, default=lambda x: float(x) if isinstance(x, (np.floating,)) else x))
+
+    # Save CSV outputs
+    outdir = args.out
+    pd.DataFrame({'pnl_decouple': pnl_dec, 'pnl_momentum': pnl_mom}).to_csv(os.path.join(outdir, 'pnl.csv'))
+    w_dec.to_csv(os.path.join(outdir, 'weights_decouple.csv'))
+    w_mom.to_csv(os.path.join(outdir, 'weights_momentum.csv'))
+
+    # Plots
+    plot_equity({'DecoupleMR': pnl_dec, 'FlowMomentum': pnl_mom}, outdir)
+
+    print(f"\nSaved outputs under: {outdir}")
+
+
+if __name__ == '__main__':
+    main()
